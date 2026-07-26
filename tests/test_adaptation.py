@@ -7,8 +7,12 @@ from typing import TYPE_CHECKING
 
 from gazeebo.adaptation import (
     TopologyQuality,
+    describe_topology,
     make_stored_target,
+    map_model_point,
     map_stored_target,
+    model_mapping_supported,
+    output_mapping_quality,
 )
 from gazeebo.contracts import DisplayRegion
 from gazeebo.geometry import DisplayTopology, Point, PointerTarget
@@ -57,6 +61,25 @@ class TopologyAdaptationTests(unittest.TestCase):
         assert mapped.quality is TopologyQuality.EXACT
         assert mapped.point == Point(600.0, 550.0)
 
+    def test_model_mapping_preserves_reach_on_an_unchanged_output(self) -> None:
+        """Moving another output cannot compress a validated display's range."""
+        source = DisplayTopology(
+            (
+                DisplayRegion("old-left", 0, 0, 3840, 2160),
+                DisplayRegion("old-laptop", 3840, 1800, 2256, 1504),
+            )
+        )
+        current = DisplayTopology(
+            (
+                DisplayRegion("new-left", 0, 0, 3840, 2160),
+                DisplayRegion("new-laptop", 4100, 1800, 2256, 1504),
+            )
+        )
+        outputs = describe_topology(source)
+        assert output_mapping_quality(outputs, current) is TopologyQuality.STRONG
+        assert map_model_point(Point(0.0, 1000.0), outputs, current) == Point(0.0, 1000.0)
+        assert map_model_point(Point(4000.0, 2000.0), outputs, current).x == 4260.0
+
     def test_resolution_and_position_change_remap_output_relative_label(self) -> None:
         """A stable output key survives logical movement and scaling."""
         source = DisplayTopology((DisplayRegion("stable", 0, 0, 1000, 500),))
@@ -87,6 +110,20 @@ class TopologyAdaptationTests(unittest.TestCase):
         assert mapped is not None
         assert mapped.quality is TopologyQuality.STRONG
         assert mapped.point.x == 1300.0
+
+    def test_removed_output_keeps_model_reach_on_surviving_geometry(self) -> None:
+        """Removing a peer cannot compress a validated surviving output's range."""
+        source = DisplayTopology(
+            (
+                DisplayRegion("old-left", 0, 0, 1000, 700),
+                DisplayRegion("old-lower", 1000, 700, 800, 600),
+            )
+        )
+        current = DisplayTopology((DisplayRegion("new-left", 0, 0, 1000, 700),))
+        outputs = describe_topology(source)
+        assert output_mapping_quality(outputs, current) is TopologyQuality.WEAK
+        assert model_mapping_supported(outputs, current)
+        assert map_model_point(Point(999.0, 699.0), outputs, current) == Point(999.0, 699.0)
 
     def test_removed_output_samples_are_excluded(self) -> None:
         """Targets belonging to an absent output do not train the current model."""

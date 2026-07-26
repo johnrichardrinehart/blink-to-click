@@ -46,6 +46,7 @@ class StubCV2:
     CAP_PROP_FRAME_WIDTH: int = 2
     CAP_PROP_FRAME_HEIGHT: int = 3
     CAP_PROP_FPS: int = 4
+    CAP_PROP_FOURCC: int = 5
     opened_sources: list[str | int] = field(default_factory=list)
 
     def VideoCapture(self, source: str | int, backend: int) -> StubCapture:  # noqa: N802
@@ -53,6 +54,11 @@ class StubCV2:
         assert backend == self.CAP_V4L2
         self.opened_sources.append(source)
         return self.captures.pop(0)
+
+    def VideoWriter_fourcc(self, *codec: str) -> int:  # noqa: N802
+        """Return one deterministic test codec identifier."""
+        assert codec == ("M", "J", "P", "G")
+        return 99
 
 
 class CameraTests(unittest.TestCase):
@@ -74,6 +80,27 @@ class CameraTests(unittest.TestCase):
         camera.close()
         camera.close()
         assert working.released
+
+    def test_explicit_codec_precedes_geometry_and_isolates_camera_identity(self) -> None:
+        """Transport changes cannot silently reuse another calibration corpus."""
+        compressed = StubCapture(True, [object()])
+        camera = OpenCVCamera(
+            device=0,
+            width=848,
+            height=480,
+            frames_per_second=30,
+            codec="MJPG",
+            cv2_module=StubCV2([compressed]),
+        )
+        assert compressed.settings == [(5, 99.0), (2, 848.0), (3, 480.0), (4, 30.0)]
+        compressed_id = camera.camera_id
+        camera.close()
+        ordinary = StubCapture(True, [object()])
+        camera = OpenCVCamera(device=0, cv2_module=StubCV2([ordinary]))
+        assert camera.camera_id != compressed_id
+        camera.close()
+        with self.assertRaisesRegex(ValueError, "four-character"):
+            OpenCVCamera(device=0, codec="JPG", cv2_module=StubCV2([]))
 
     def test_no_frame_fails_after_releasing_every_candidate(self) -> None:
         """No-camera startup fails safely without retaining a capture."""

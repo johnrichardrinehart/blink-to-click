@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import threading
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from gazeebo.cli import (
@@ -12,9 +15,10 @@ from gazeebo.cli import (
     _load_startup_inputs,
     _open_startup_resources,
     build_parser,
+    main,
 )
-from gazeebo.game import GameConfig
 from gazeebo.state import TrainingState, TrainingStore, TrainingStoreError
+from gazeebo.training import TrainingConfig
 
 
 class CliTests(unittest.TestCase):
@@ -25,17 +29,45 @@ class CliTests(unittest.TestCase):
         arguments = build_parser().parse_args([])
         assert arguments.command == "run"
         assert arguments.camera is None
+        assert arguments.camera_codec is None
         assert arguments.width == 640
         assert arguments.height == 480
         assert arguments.calibration_samples > 0
-        assert 0.0 < arguments.open_eye_threshold < 1.0
+        assert arguments.head_diagnostic_minimum == 3.0
+        assert arguments.head_recovery_timeout == 10.0
         assert arguments.pointer_update_interval == 0.10
+        assert arguments.smoothing_alpha == 1.0
+        assert arguments.smoothing_maximum_step == 10000.0
+        assert arguments.noise_minimum_alpha == 1.0
+        assert arguments.noise_maximum_alpha == 1.0
         assert not arguments.ephemeral
-        assert arguments.game_batch_size == 5
-        assert arguments.game_precision_threshold == 100.0
-        assert arguments.game_maximum_targets == 55
-        assert arguments.game_settle + arguments.game_dwell == 2.0
+        assert arguments.training_batch_size == 5
+        assert arguments.training_precision_threshold == 100.0
+        assert arguments.training_maximum_targets == 55
+        assert arguments.training_preparation == 2.0
+        assert arguments.training_transition_overlap == 1.0
+        assert arguments.training_measurement == 2.0
+        assert arguments.training_target_size_mm == 12.0
+        assert arguments.training_fallback_diameter == 72.0
+        assert arguments.context_refresh_interval == 1.0
+        assert arguments.allow_display_reauthorization_pause
+        assert arguments.diagnostic_capture is None
         assert not arguments.debug_hud
+
+    def test_dump_and_stats_commands_need_no_camera_or_portal(self) -> None:
+        """Read-only introspection returns stable JSON before runtime startup."""
+        dump_output = io.StringIO()
+        stats_output = io.StringIO()
+        with patch("gazeebo.cli._open_startup_resources") as startup:
+            with redirect_stdout(dump_output):
+                assert main(["dump-training", "--ephemeral"]) == 0
+            with redirect_stdout(stats_output):
+                assert main(["training-stats", "--ephemeral"]) == 0
+        startup.assert_not_called()
+        assert json.loads(dump_output.getvalue())["version"] >= 5
+        statistics = json.loads(stats_output.getvalue())
+        assert statistics["schema_version"] >= 5
+        assert statistics["target_count"] == 0
 
     def test_training_commands_do_not_expose_profiles(self) -> None:
         """Users request training or reset one automatic local corpus."""
@@ -50,6 +82,23 @@ class CliTests(unittest.TestCase):
         assert _camera_device(None) is None
         assert _camera_device("2") == 2
         assert _camera_device("/dev/video2") == "/dev/video2"
+        assert build_parser().parse_args(["--camera-codec", "MJPG"]).camera_codec == "MJPG"
+
+    def test_default_face_confidence_allows_valid_profile_geometry(self) -> None:
+        """The runtime uses the tracker's profile-capable landmark threshold."""
+        arguments = build_parser().parse_args([])
+        assert arguments.vision_confidence == 0.20
+
+    def test_diagnostic_capture_cli_is_explicitly_disableable(self) -> None:
+        """CLI policy overrides the default-enabled configuration path."""
+        enabled = build_parser().parse_args(["--diagnostic-capture"])
+        disabled = build_parser().parse_args(["--no-diagnostic-capture"])
+        reset = build_parser().parse_args(["reset-diagnostics"])
+        statistics = build_parser().parse_args(["diagnostic-stats"])
+        assert enabled.diagnostic_capture
+        assert not disabled.diagnostic_capture
+        assert reset.command == "reset-diagnostics"
+        assert statistics.command == "diagnostic-stats"
 
     def test_zero_pointer_interval_requests_continuous_updates(self) -> None:
         """A zero interval remains available for explicit development tuning."""
@@ -147,19 +196,19 @@ class CliTests(unittest.TestCase):
         assert camera.closed
         assert vision.closed
 
-    def test_non_terminating_game_values_are_rejected(self) -> None:
-        """Invalid game timing fails before runtime resources can open."""
-        arguments = build_parser().parse_args(["--game-dwell", "2", "--game-target-timeout", "1"])
-        with self.assertRaisesRegex(ValueError, "timeout"):
-            GameConfig(
-                batch_size=arguments.game_batch_size,
-                precision_threshold=arguments.game_precision_threshold,
-                maximum_targets=arguments.game_maximum_targets,
-                settle_seconds=arguments.game_settle,
-                dwell_seconds=arguments.game_dwell,
-                target_timeout_seconds=arguments.game_target_timeout,
-                minimum_diameter=arguments.game_minimum_diameter,
-                maximum_diameter=arguments.game_maximum_diameter,
+    def test_non_terminating_training_values_are_rejected(self) -> None:
+        """Invalid training timing fails before runtime resources can open."""
+        arguments = build_parser().parse_args(["--training-measurement", "0"])
+        with self.assertRaisesRegex(ValueError, "windows"):
+            TrainingConfig(
+                batch_size=arguments.training_batch_size,
+                precision_threshold=arguments.training_precision_threshold,
+                maximum_targets=arguments.training_maximum_targets,
+                preparation_seconds=arguments.training_preparation,
+                transition_overlap_seconds=arguments.training_transition_overlap,
+                measurement_seconds=arguments.training_measurement,
+                physical_target_diameter_mm=arguments.training_target_size_mm,
+                fallback_target_diameter=arguments.training_fallback_diameter,
             )
 
 

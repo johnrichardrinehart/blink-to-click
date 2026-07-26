@@ -6,6 +6,7 @@ import asyncio
 import unittest
 from dataclasses import dataclass, field
 
+from gazeebo.contracts import TrainingRegionStatus
 from gazeebo.hud import LayerShellDebugHud
 
 
@@ -37,11 +38,19 @@ class HudTests(unittest.TestCase):
             authorized_regions=("display-a", "display-b", "display-c"),
         )
         hud.set_model_context("global+context-4", "weak", "inferred-weak")
+        hud.set_noise_context("inferred-compatible", 0.2, 12.0)
+        hud.set_evidence_context("head+face")
+        hud.set_training_region(
+            TrainingRegionStatus("display-c:2,2", 2.25, 1.25, 3.50, 17, 27, "high-surprise")
+        )
         asyncio.run(hud.update("display-b", 300.0, 400.0))
         assert surface.updates == [
             (
                 "display-b; authorized: display-a, display-b, display-c; "
-                "model: global+context-4; confidence: inferred-weak; topology: weak",
+                "model: global+context-4; confidence: inferred-weak; topology: weak; "
+                "evidence: head+face; training: display-c:2,2 high-surprise CVaR90 "
+                "2.25 1.25..3.50 (17/27); noise: inferred-compatible; alpha: 0.20; "
+                "dead-zone: 12.0px",
                 300.0,
                 400.0,
             )

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 FRAME_DIMENSIONS = 2
+FOURCC_LENGTH = 4
 
 
 class CameraError(RuntimeError):
@@ -40,9 +41,13 @@ class _CV2(Protocol):
     CAP_PROP_FRAME_WIDTH: int
     CAP_PROP_FRAME_HEIGHT: int
     CAP_PROP_FPS: int
+    CAP_PROP_FOURCC: int
 
     def VideoCapture(self, source: str | int, backend: int) -> _Capture:  # noqa: N802
         """Open a capture source."""
+
+    def VideoWriter_fourcc(self, *codec: str) -> int:  # noqa: N802
+        """Encode a four-character capture format."""
 
 
 def local_camera_candidates() -> tuple[str | int, ...]:
@@ -70,12 +75,16 @@ class OpenCVCamera:
         width: int = 640,
         height: int = 480,
         frames_per_second: int = 30,
+        codec: str | None = None,
         candidates: Iterable[str | int] | None = None,
         cv2_module: _CV2 | None = None,
     ) -> None:
         """Open an explicit device or the first local source that returns a frame."""
         if width <= 0 or height <= 0 or frames_per_second <= 0:
             msg = "camera dimensions and frame rate must be positive"
+            raise ValueError(msg)
+        if codec is not None and (len(codec) != FOURCC_LENGTH or not codec.isascii()):
+            msg = "camera codec must be a four-character ASCII code"
             raise ValueError(msg)
         if cv2_module is None:
             cv2_module = cast("_CV2", cv2)
@@ -89,6 +98,11 @@ class OpenCVCamera:
         )
         for source in sources:
             capture = cv2_module.VideoCapture(source, cv2_module.CAP_V4L2)
+            if codec is not None:
+                capture.set(
+                    cv2_module.CAP_PROP_FOURCC,
+                    float(cv2_module.VideoWriter_fourcc(*codec)),
+                )
             capture.set(cv2_module.CAP_PROP_FRAME_WIDTH, float(width))
             capture.set(cv2_module.CAP_PROP_FRAME_HEIGHT, float(height))
             capture.set(cv2_module.CAP_PROP_FPS, float(frames_per_second))
@@ -101,6 +115,8 @@ class OpenCVCamera:
                 if isinstance(shape, tuple) and len(shape) >= FRAME_DIMENSIONS:
                     self._dimensions = (int(shape[1]), int(shape[0]))
                 identity = f"{source!s}:{self._dimensions[0]}x{self._dimensions[1]}"
+                if codec is not None:
+                    identity = f"{identity}:{codec}"
                 self._camera_id = hashlib.sha256(identity.encode()).hexdigest()
                 break
             capture.release()

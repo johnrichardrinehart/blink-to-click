@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import sys
 from typing import TYPE_CHECKING
 
 from gazeebo import __version__
@@ -11,11 +13,20 @@ from gazeebo.camera import CameraError, OpenCVCamera
 from gazeebo.contexts import build_router
 from gazeebo.contracts import RuntimeStatus
 from gazeebo.control import ControlError, TrainingControl, request_training
-from gazeebo.game import GameConfig, GameError, LayerShellCalibrationGame
+from gazeebo.diagnostics import (
+    CapturingVisionEstimator,
+    DiagnosticArchive,
+    DiagnosticArchiveError,
+    diagnostic_archive_stats,
+    diagnostic_capture_enabled,
+    reset_diagnostic_archive,
+)
+from gazeebo.display import DisplayMonitorError, NativeDisplayMonitor
 from gazeebo.geometry import DisplayTopology
 from gazeebo.hud import LayerShellDebugHud
 from gazeebo.portal import PortalError, PortalPointerController
 from gazeebo.runtime import (
+    DISPLAY_REAUTHORIZATION_RESULT,
     FEATURE_SCHEMA,
     ConsoleStatus,
     TrackingConfig,
@@ -24,10 +35,13 @@ from gazeebo.runtime import (
     run_owned_session,
 )
 from gazeebo.state import TrainingState, TrainingStore, TrainingStoreError
+from gazeebo.training import LayerShellTraining, TrainingConfig, TrainingError
 from gazeebo.vision import OpenSeeFaceEstimator, VisionError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from gazeebo.contracts import VisionEstimator
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,45 +53,84 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("run", "train", "reset-training"),
+        choices=(
+            "run",
+            "train",
+            "reset-training",
+            "dump-training",
+            "training-stats",
+            "reset-diagnostics",
+            "diagnostic-stats",
+        ),
         default="run",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--camera", help="V4L2 device path or numeric index")
+    parser.add_argument(
+        "--camera-codec",
+        choices=("YUYV", "MJPG"),
+        help="request an uncompressed YUYV or camera-compressed MJPEG transport",
+    )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--vision-confidence", type=float, default=0.55)
-    parser.add_argument("--open-eye-threshold", type=float, default=0.35)
+    parser.add_argument("--vision-confidence", type=float, default=0.20)
+    parser.add_argument("--head-diagnostic-minimum", type=float, default=3.0)
+    parser.add_argument("--head-recovery-timeout", type=float, default=10.0)
+    parser.add_argument("--head-failure-panel-seconds", type=float, default=2.0)
     parser.add_argument("--calibration-settle", type=float, default=1.00)
     parser.add_argument("--calibration-samples", type=int, default=8)
     parser.add_argument("--startup-context-samples", type=int, default=8)
-    parser.add_argument("--smoothing-alpha", type=float, default=0.35)
+    parser.add_argument("--smoothing-alpha", type=float, default=1.0)
     parser.add_argument("--smoothing-dead-zone", type=float, default=6.0)
-    parser.add_argument("--smoothing-maximum-step", type=float, default=600.0)
+    parser.add_argument("--smoothing-maximum-step", type=float, default=10000.0)
     parser.add_argument(
         "--pointer-update-interval",
         type=float,
         default=0.10,
         help="minimum seconds between pointer moves; zero updates continuously",
     )
-    parser.add_argument("--game-batch-size", type=int, default=5)
-    parser.add_argument("--game-precision-threshold", type=float, default=100.0)
-    parser.add_argument("--game-maximum-targets", type=int, default=55)
-    parser.add_argument("--game-settle", type=float, default=0.75)
-    parser.add_argument("--game-dwell", type=float, default=1.25)
-    parser.add_argument("--game-target-timeout", type=float, default=6.0)
-    parser.add_argument("--game-minimum-diameter", type=float, default=48.0)
-    parser.add_argument("--game-maximum-diameter", type=float, default=144.0)
+    parser.add_argument("--training-batch-size", type=int, default=5)
+    parser.add_argument("--training-precision-threshold", type=float, default=100.0)
+    parser.add_argument("--training-maximum-targets", type=int, default=55)
+    parser.add_argument("--training-preparation", type=float, default=2.0)
+    parser.add_argument("--training-transition-overlap", type=float, default=1.0)
+    parser.add_argument("--training-measurement", type=float, default=2.0)
+    parser.add_argument("--training-target-size-mm", type=float, default=12.0)
+    parser.add_argument("--training-fallback-diameter", type=float, default=72.0)
+    parser.add_argument("--training-countdown-interval", type=float, default=1.0)
+    parser.add_argument("--training-completion-seconds", type=float, default=2.0)
+    parser.add_argument("--context-refresh-interval", type=float, default=1.0)
+    parser.add_argument("--noise-minimum-alpha", type=float, default=1.0)
+    parser.add_argument("--noise-maximum-alpha", type=float, default=1.0)
+    parser.add_argument("--noise-minimum-dead-zone", type=float, default=2.0)
+    parser.add_argument("--noise-maximum-dead-zone", type=float, default=40.0)
+    parser.add_argument("--noise-minimum-samples", type=int, default=20)
+    parser.add_argument("--noise-maximum-targets", type=int, default=32)
+    parser.add_argument(
+        "--allow-display-reauthorization-pause",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pause and reacquire portal authorization after display additions",
+    )
     parser.add_argument(
         "--ephemeral",
         action="store_true",
         help="do not read or write local target-level training data",
     )
     parser.add_argument(
+        "--diagnostic-capture",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "retain lossless frames from 3 seconds before through 3 seconds after "
+            "head warnings (enabled by default; sensitive; 2 GiB quota)"
+        ),
+    )
+    parser.add_argument(
         "--debug-hud",
         action="store_true",
-        help="show authorized regions, routing, and cursor coordinates once per second",
+        help="show authorized regions, routing, training surprise, and cursor coordinates",
     )
     return parser
 
@@ -100,20 +153,32 @@ def _tracking_config(arguments: argparse.Namespace) -> TrackingConfig:
         smoothing_dead_zone=arguments.smoothing_dead_zone,
         smoothing_maximum_step=arguments.smoothing_maximum_step,
         pointer_update_interval_seconds=arguments.pointer_update_interval,
-        open_eye_threshold=arguments.open_eye_threshold,
+        head_diagnostic_minimum_seconds=arguments.head_diagnostic_minimum,
+        head_recovery_timeout_seconds=arguments.head_recovery_timeout,
+        head_failure_panel_seconds=arguments.head_failure_panel_seconds,
+        context_refresh_interval_seconds=arguments.context_refresh_interval,
+        allow_display_reauthorization_pause=arguments.allow_display_reauthorization_pause,
+        noise_minimum_alpha=arguments.noise_minimum_alpha,
+        noise_maximum_alpha=arguments.noise_maximum_alpha,
+        noise_minimum_dead_zone=arguments.noise_minimum_dead_zone,
+        noise_maximum_dead_zone=arguments.noise_maximum_dead_zone,
+        noise_minimum_samples=arguments.noise_minimum_samples,
+        noise_maximum_targets=arguments.noise_maximum_targets,
     )
 
 
-def _game_config(arguments: argparse.Namespace) -> GameConfig:
-    return GameConfig(
-        batch_size=arguments.game_batch_size,
-        precision_threshold=arguments.game_precision_threshold,
-        maximum_targets=arguments.game_maximum_targets,
-        settle_seconds=arguments.game_settle,
-        dwell_seconds=arguments.game_dwell,
-        target_timeout_seconds=arguments.game_target_timeout,
-        minimum_diameter=arguments.game_minimum_diameter,
-        maximum_diameter=arguments.game_maximum_diameter,
+def _training_config(arguments: argparse.Namespace) -> TrainingConfig:
+    return TrainingConfig(
+        batch_size=arguments.training_batch_size,
+        precision_threshold=arguments.training_precision_threshold,
+        maximum_targets=arguments.training_maximum_targets,
+        preparation_seconds=arguments.training_preparation,
+        transition_overlap_seconds=arguments.training_transition_overlap,
+        measurement_seconds=arguments.training_measurement,
+        physical_target_diameter_mm=arguments.training_target_size_mm,
+        fallback_target_diameter=arguments.training_fallback_diameter,
+        countdown_interval_seconds=arguments.training_countdown_interval,
+        completion_seconds=arguments.training_completion_seconds,
     )
 
 
@@ -123,6 +188,7 @@ def _open_vision(arguments: argparse.Namespace) -> tuple[OpenCVCamera, OpenSeeFa
         width=arguments.width,
         height=arguments.height,
         frames_per_second=arguments.fps,
+        codec=arguments.camera_codec,
     )
     try:
         vision = OpenSeeFaceEstimator(
@@ -237,46 +303,43 @@ def _needs_training(
     return False
 
 
-async def _run(  # noqa: C901, PLR0911, PLR0912, PLR0915
+async def _run_session(  # noqa: C901
     arguments: argparse.Namespace,
+    status: ConsoleStatus,
+    store: TrainingStore,
+    stop: asyncio.Event,
+    *,
+    train_requested: bool,
 ) -> int:
-    status = ConsoleStatus()
-    status.report(RuntimeStatus.STARTING)
+    """Own one portal authorization epoch inside the foreground process."""
     tracking = _tracking_config(arguments)
-    game_config = _game_config(arguments)
-    store = TrainingStore(ephemeral=arguments.ephemeral)
-    stop = asyncio.Event()
-    install_signal_handlers(stop)
+    training_config = _training_config(arguments)
     training_requested = asyncio.Event()
     control = TrainingControl(training_requested)
     pointer: PortalPointerController | None = None
     hud: LayerShellDebugHud | None = None
-    game: LayerShellCalibrationGame | None = None
+    training: LayerShellTraining | None = None
+    monitor: NativeDisplayMonitor | None = None
     camera: OpenCVCamera | None = None
-    vision: OpenSeeFaceEstimator | None = None
+    vision: VisionEstimator | None = None
     session_started = False
     try:
-        status.report(RuntimeStatus.LOADING)
-        if arguments.command == "reset-training":
-            store.reset()
-            status.report(RuntimeStatus.STOPPED)
-            return 0
-        if arguments.command == "train" and await request_training():
-            status.report(RuntimeStatus.STOPPED, "active session accepted training request")
-            return 0
-        if stop.is_set():
-            return 0
         await control.start()
         status.report(RuntimeStatus.AUTHORIZING)
         startup = await _load_startup_inputs(arguments, store, stop)
         if startup is None:
             return 0
         state, pointer, camera, vision = startup
+        if arguments.diagnostic_capture:
+            vision = CapturingVisionEstimator(
+                vision,
+                DiagnosticArchive(status=status),
+            )
+        monitor = NativeDisplayMonitor.create()
         if arguments.debug_hud:
             hud = LayerShellDebugHud.create(pointer.regions)
-        train_requested = arguments.command == "train"
         if train_requested or _needs_training(state, pointer, camera):
-            game = LayerShellCalibrationGame.create(pointer.regions)
+            training = LayerShellTraining.create(pointer.regions)
         session_started = True
         return await run_owned_session(
             camera,
@@ -285,54 +348,145 @@ async def _run(  # noqa: C901, PLR0911, PLR0912, PLR0915
             status,
             stop,
             hud=hud,
-            game=game,
+            training=training,
             tracking=tracking,
-            game_config=game_config,
+            training_config=training_config,
             training_store=store,
             training_state=state,
             train_requested=train_requested,
             training_requested_event=training_requested,
-            game_factory=LayerShellCalibrationGame.create,
+            training_factory=LayerShellTraining.create,
+            diagnostic_factory=LayerShellTraining.create,
             training_control=control,
+            display_monitor=monitor,
         )
+    finally:
+        if not session_started:
+            await control.close()
+            if monitor is not None:
+                monitor.close()
+            if vision is not None:
+                vision.close()
+            if camera is not None:
+                camera.close()
+            if training is not None:
+                await training.close()
+            if hud is not None:
+                await hud.close()
+            if pointer is not None:
+                await pointer.close()
+
+
+async def _run(arguments: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912
+    """Run one foreground process across any required authorization epochs."""
+    status = ConsoleStatus()
+    status.report(RuntimeStatus.STARTING)
+    store = TrainingStore(ephemeral=arguments.ephemeral)
+    stop = asyncio.Event()
+    install_signal_handlers(stop)
+    try:
+        if arguments.command == "dump-training":
+            sys.stdout.write(store.dump_json())
+            status.report(RuntimeStatus.STOPPED)
+            return 0
+        if arguments.command == "training-stats":
+            statistics = store.stats()
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "bytes_per_target": statistics.bytes_per_target,
+                        "compression_ratio": statistics.compression_ratio,
+                        "logical_bytes": statistics.logical_bytes,
+                        "on_disk_bytes": statistics.on_disk_bytes,
+                        "schema_version": statistics.schema_version,
+                        "target_count": statistics.target_count,
+                    },
+                    allow_nan=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            status.report(RuntimeStatus.STOPPED)
+            return 0
+        if arguments.command == "reset-training":
+            store.reset()
+            status.report(RuntimeStatus.STOPPED)
+            return 0
+        if arguments.command == "diagnostic-stats":
+            diagnostic_statistics = diagnostic_archive_stats()
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "event_count": diagnostic_statistics.event_count,
+                        "maximum_bytes": diagnostic_statistics.maximum_bytes,
+                        "on_disk_bytes": diagnostic_statistics.on_disk_bytes,
+                        "schema_version": diagnostic_statistics.schema_version,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            status.report(RuntimeStatus.STOPPED)
+            return 0
+        if arguments.command == "reset-diagnostics":
+            reset_diagnostic_archive()
+            status.report(RuntimeStatus.STOPPED)
+            return 0
+        if arguments.command == "train" and await request_training():
+            status.report(RuntimeStatus.STOPPED, "active session accepted training request")
+            return 0
+        status.report(RuntimeStatus.LOADING)
+        train_requested = arguments.command == "train"
+        while not stop.is_set():
+            result = await _run_session(
+                arguments,
+                status,
+                store,
+                stop,
+                train_requested=train_requested,
+            )
+            if result != DISPLAY_REAUTHORIZATION_RESULT:
+                return result
+            train_requested = False
+            status.report(
+                RuntimeStatus.DISPLAY_CHANGE,
+                "portal authorization refresh starting",
+            )
+        return 0  # noqa: TRY300
     except ControlError as error:
         status.report(RuntimeStatus.INPUT_ERROR, str(error))
         return 2
-    except PortalError as error:
+    except (PortalError, DisplayMonitorError) as error:
         status.report(RuntimeStatus.INPUT_ERROR, str(error))
         return 2
     except TrainingStoreError as error:
         status.report(RuntimeStatus.STORE_ERROR, str(error))
         return 1
-    except GameError as error:
-        status.report(RuntimeStatus.GAME_ERROR, str(error))
+    except DiagnosticArchiveError as error:
+        status.report(RuntimeStatus.DIAGNOSTIC_CAPTURE, str(error))
+        return 1
+    except TrainingError as error:
+        status.report(RuntimeStatus.TRAINING_ERROR, str(error))
         return 1
     except (CameraError, VisionError, TrackingError) as error:
         if stop.is_set():
             return 0
         status.report(RuntimeStatus.CAMERA_ERROR, str(error))
         return 1
-    finally:
-        if not session_started:
-            await control.close()
-            if vision is not None:
-                vision.close()
-            if camera is not None:
-                camera.close()
-            if game is not None:
-                await game.close()
-            if hud is not None:
-                await hud.close()
-            if pointer is not None:
-                await pointer.close()
-            if arguments.command != "reset-training":
-                status.report(RuntimeStatus.STOPPED)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one foreground navigation or training command."""
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    if arguments.command in {"run", "train"}:
+        try:
+            arguments.diagnostic_capture = diagnostic_capture_enabled(
+                cli_value=arguments.diagnostic_capture
+            )
+        except DiagnosticArchiveError as error:
+            ConsoleStatus().report(RuntimeStatus.DIAGNOSTIC_CAPTURE, str(error))
+            return 1
     try:
         return asyncio.run(_run(arguments))
     except ValueError as error:

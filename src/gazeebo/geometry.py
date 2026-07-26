@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import statistics
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
     from gazeebo.contracts import DisplayRegion
 
 MAXIMUM_CALIBRATION_INSET = 0.5
+PREDICTION_POINT_MEDIAN_WINDOW = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +21,23 @@ class Point:
 
     x: float
     y: float
+
+
+def rolling_point_median(
+    history: list[Point],
+    point: Point,
+    window_size: int = PREDICTION_POINT_MEDIAN_WINDOW,
+) -> Point:
+    """Reject transient coordinate outliers without animating cursor transit."""
+    if window_size <= 0:
+        msg = "prediction point median window must be positive"
+        raise ValueError(msg)
+    history.append(point)
+    del history[:-window_size]
+    return Point(
+        statistics.median(item.x for item in history),
+        statistics.median(item.y for item in history),
+    )
 
 
 @dataclass(frozen=True, slots=True)

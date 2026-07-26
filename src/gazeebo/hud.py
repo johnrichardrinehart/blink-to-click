@@ -12,7 +12,7 @@ from gazeebo.portal import PortalError
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from gazeebo.contracts import DisplayRegion
+    from gazeebo.contracts import DisplayRegion, TrainingRegionStatus
 
 HUD_INTERVAL_SECONDS = 1.0
 HUD_ERROR_SIZE = 256
@@ -104,6 +104,11 @@ class LayerShellDebugHud:
         self._routing = "unselected"
         self._topology_quality = "unknown"
         self._model_confidence = "unknown"
+        self._noise_confidence = "default"
+        self._noise_alpha = 0.0
+        self._noise_dead_zone = 0.0
+        self._evidence = "head+face"
+        self._training_region = "inactive"
         self._closed = False
 
     @classmethod
@@ -125,6 +130,24 @@ class LayerShellDebugHud:
         self._topology_quality = topology_quality
         self._model_confidence = model_confidence
 
+    def set_noise_context(self, confidence: str, alpha: float, dead_zone: float) -> None:
+        """Retain bounded noise-routing diagnostics for the next redraw."""
+        self._noise_confidence = confidence
+        self._noise_alpha = alpha
+        self._noise_dead_zone = dead_zone
+
+    def set_evidence_context(self, evidence_class: str) -> None:
+        """Retain the current head-only or pupil-refined evidence class."""
+        self._evidence = evidence_class
+
+    def set_training_region(self, context: TrainingRegionStatus) -> None:
+        """Retain bounded target-selection evidence for the next redraw."""
+        self._training_region = (
+            f"{context.region} {context.mode} CVaR90 {context.cvar90:.2f} "
+            f"{context.surprise_lower:.2f}..{context.surprise_upper:.2f} "
+            f"({context.observed_regions}/{context.total_regions})"
+        )
+
     async def update(self, region_id: str, x: float, y: float) -> None:
         """Replace the HUD content at most once per one-second interval."""
         if self._closed:
@@ -138,7 +161,9 @@ class LayerShellDebugHud:
             displayed_region = (
                 f"{region_id}; authorized: {authorized}; "
                 f"model: {self._routing}; confidence: {self._model_confidence}; "
-                f"topology: {self._topology_quality}"
+                f"topology: {self._topology_quality}; evidence: {self._evidence}; "
+                f"training: {self._training_region}; noise: {self._noise_confidence}; "
+                f"alpha: {self._noise_alpha:.2f}; dead-zone: {self._noise_dead_zone:.1f}px"
             )
         self._surface.show(displayed_region, x, y)
         self._last_update = now
