@@ -95,6 +95,8 @@ class TrainingStoreTests(unittest.TestCase):
                 noise=CursorNoiseSummary(120, 4.0, 5.0, 3.0, 6.0, 12.0),
                 unseen_error=123.5,
                 predictive_uncertainty=45.25,
+                horizontal_residual=-100.25,
+                vertical_residual=71.5,
             )
             expected.validations[0] = replace(
                 expected.validations[0],
@@ -138,7 +140,7 @@ class TrainingStoreTests(unittest.TestCase):
         assert isinstance(records, list)
         for record in records:
             assert isinstance(record, list)
-            del record[-3:]
+            del record[-5:]
         validations = raw["r"]
         assert isinstance(validations, list)
         for validation in validations:
@@ -156,7 +158,7 @@ class TrainingStoreTests(unittest.TestCase):
         assert isinstance(records, list)
         for record in records:
             assert isinstance(record, list)
-            del record[-2:]
+            del record[-4:]
         validations = raw["r"]
         assert isinstance(validations, list)
         for validation in validations:
@@ -173,6 +175,11 @@ class TrainingStoreTests(unittest.TestCase):
         """Schema-seven errors remain exact without fabricated tail metrics."""
         raw = _encode_compact_state(state())
         raw["v"] = 7
+        records = raw["t"]
+        assert isinstance(records, list)
+        for record in records:
+            assert isinstance(record, list)
+            del record[-2:]
         validations = raw["r"]
         assert isinstance(validations, list)
         for validation in validations:
@@ -184,6 +191,20 @@ class TrainingStoreTests(unittest.TestCase):
         assert migrated.validations[0].maximum_region_cvar90 is None
         assert migrated.validations[0].maximum_region_upper is None
 
+    def test_v8_compact_targets_migrate_without_inventing_component_residuals(self) -> None:
+        """Schema-eight radial evidence remains exact without fabricated axes."""
+        raw = _encode_compact_state(state())
+        raw["v"] = 8
+        records = raw["t"]
+        assert isinstance(records, list)
+        for record in records:
+            assert isinstance(record, list)
+            del record[-2:]
+        migrated = _decode_state(raw)
+        assert migrated.targets[0].horizontal_residual is None
+        assert migrated.targets[0].vertical_residual is None
+        assert migrated.validations[0] == state().validations[0]
+
     def test_surprise_evidence_is_finite_non_negative_and_optional(self) -> None:
         """Only bounded target-level surprise values may enter persistence."""
         assert replace(target(), unseen_error=None, predictive_uncertainty=None)
@@ -191,6 +212,10 @@ class TrainingStoreTests(unittest.TestCase):
             replace(target(), unseen_error=float("nan"))
         with self.assertRaisesRegex(ValueError, "surprise"):
             replace(target(), predictive_uncertainty=-1.0)
+        with self.assertRaisesRegex(ValueError, "surprise"):
+            replace(target(), horizontal_residual=float("nan"), vertical_residual=1.0)
+        with self.assertRaisesRegex(ValueError, "paired"):
+            replace(target(), horizontal_residual=1.0)
 
     def test_noise_summary_is_finite_bounded_and_ordered(self) -> None:
         """Persistence cannot retain malformed or frame-sized noise records."""

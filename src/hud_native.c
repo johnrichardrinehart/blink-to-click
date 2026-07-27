@@ -407,6 +407,90 @@ static void render_training(HudState *state, HudBuffer *frame, double x,
   cairo_surface_destroy(surface);
 }
 
+static void render_refinement_grid(HudState *state, HudBuffer *frame,
+                                   double left, double top, double width,
+                                   double height, int32_t depth,
+                                   const char *source, int32_t row_count,
+                                   int32_t column_count, const char *labels) {
+  memset(frame->pixels, 0,
+         (size_t)state->frame_width * (size_t)state->frame_height *
+             sizeof(*frame->pixels));
+  cairo_surface_t *surface = cairo_image_surface_create_for_data(
+      (unsigned char *)frame->pixels, CAIRO_FORMAT_ARGB32, state->frame_width,
+      state->frame_height, state->frame_width * 4);
+  cairo_t *cairo = cairo_create(surface);
+  cairo_set_operator(cairo, CAIRO_OPERATOR_SOURCE);
+  cairo_set_line_width(cairo, 5.0);
+  cairo_set_source_rgba(cairo, 0.0, 0.95, 1.0, 0.92);
+  cairo_rectangle(cairo, left, top, width, height);
+  cairo_stroke(cairo);
+  cairo_set_line_width(cairo, 3.0);
+  for (int32_t index = 1; index < column_count; ++index) {
+    cairo_move_to(cairo, left + width * index / column_count, top);
+    cairo_line_to(cairo, left + width * index / column_count, top + height);
+  }
+  for (int32_t index = 1; index < row_count; ++index) {
+    cairo_move_to(cairo, left, top + height * index / row_count);
+    cairo_line_to(cairo, left + width, top + height * index / row_count);
+  }
+  cairo_stroke(cairo);
+
+  PangoLayout *label_layout = pango_cairo_create_layout(cairo);
+  PangoFontDescription *label_font =
+      pango_font_description_from_string("Sans Bold 30");
+  pango_layout_set_font_description(label_layout, label_font);
+  for (int32_t row = 0; row < row_count; ++row) {
+    for (int32_t column = 0; column < column_count; ++column) {
+      double center_x = left + width * (column + 0.5) / column_count;
+      double center_y = top + height * (row + 0.5) / row_count;
+      if (center_x < 0.0 || center_x >= state->frame_width || center_y < 0.0 ||
+          center_y >= state->frame_height) {
+        continue;
+      }
+      char label[2] = {labels[row * column_count + column], '\0'};
+      pango_layout_set_text(label_layout, label, 1);
+      int text_width = 0;
+      int text_height = 0;
+      pango_layout_get_pixel_size(label_layout, &text_width, &text_height);
+      cairo_set_source_rgba(cairo, 0.02, 0.02, 0.02, 0.72);
+      cairo_arc(cairo, center_x, center_y, 24.0, 0.0, 6.28318530718);
+      cairo_fill(cairo);
+      cairo_move_to(cairo, center_x - text_width / 2.0,
+                    center_y - text_height / 2.0);
+      cairo_set_source_rgba(cairo, 1.0, 1.0, 1.0, 1.0);
+      pango_cairo_show_layout(cairo, label_layout);
+    }
+  }
+
+  PangoLayout *status = pango_cairo_create_layout(cairo);
+  PangoFontDescription *status_font =
+      pango_font_description_from_string("Sans Bold 18");
+  pango_layout_set_font_description(status, status_font);
+  char status_text[256];
+  snprintf(status_text, sizeof(status_text), "Refinement %dx%d depth %d — %s",
+           row_count, column_count, depth, source);
+  pango_layout_set_text(status, status_text, -1);
+  int status_width = 0;
+  int status_height = 0;
+  pango_layout_get_pixel_size(status, &status_width, &status_height);
+  cairo_set_source_rgba(cairo, 0.02, 0.02, 0.02, 0.82);
+  rounded_rectangle(cairo, 18.0, 18.0, status_width + 24.0,
+                    status_height + 18.0, HUD_RADIUS);
+  cairo_fill(cairo);
+  cairo_move_to(cairo, 30.0, 27.0);
+  cairo_set_source_rgba(cairo, 1.0, 1.0, 1.0, 0.98);
+  pango_cairo_show_layout(cairo, status);
+
+  pango_font_description_free(label_font);
+  pango_font_description_free(status_font);
+  g_object_unref(label_layout);
+  g_object_unref(status);
+  cairo_destroy(cairo);
+  cairo_surface_flush(surface);
+  cairo_surface_mark_dirty(surface);
+  cairo_surface_destroy(surface);
+}
+
 static void render_training_message(HudState *state, HudBuffer *frame,
                                     const char *text) {
   memset(frame->pixels, 0,
@@ -1054,6 +1138,48 @@ gazeebo_training_show_target(void *handle, double x, double y, double diameter,
     wl_surface_commit(state->surface);
     if (wl_display_flush(state->display) < 0 && errno != EAGAIN) {
       set_error(state, "cannot flush calibration training update");
+    }
+  }
+  if (state->failed) {
+    copy_error(state, error, error_size);
+    return -1;
+  }
+  return 0;
+}
+
+__attribute__((visibility("default"))) int
+gazeebo_training_show_grid(void *handle, double left, double top, double width,
+                           double height, int32_t depth, const char *source,
+                           int32_t row_count, int32_t column_count,
+                           const char *labels, char *error, size_t error_size) {
+  HudState *state = handle;
+  if (state == NULL || source == NULL || labels == NULL || state->closed ||
+      width <= 0.0 || height <= 0.0 || depth < 0 || row_count < 2 ||
+      row_count > 6 || column_count < 2 || column_count > 6 ||
+      strlen(labels) != (size_t)(row_count * column_count)) {
+    if (error != NULL && error_size > 0) {
+      snprintf(error, error_size, "refinement grid input is invalid");
+    }
+    return -1;
+  }
+  (void)wl_display_dispatch_pending(state->display);
+  HudBuffer *frame = available_buffer(state);
+  if (frame == NULL && wl_display_roundtrip(state->display) >= 0) {
+    frame = available_buffer(state);
+  }
+  if (frame == NULL) {
+    set_error(state, "refinement grid has no available drawing buffer");
+  }
+  if (!state->failed) {
+    render_refinement_grid(state, frame, left, top, width, height, depth,
+                           source, row_count, column_count, labels);
+    frame->busy = true;
+    wl_surface_attach(state->surface, frame->buffer, 0, 0);
+    wl_surface_damage_buffer(state->surface, 0, 0, state->frame_width,
+                             state->frame_height);
+    wl_surface_commit(state->surface);
+    if (wl_display_flush(state->display) < 0 && errno != EAGAIN) {
+      set_error(state, "cannot flush refinement grid update");
     }
   }
   if (state->failed) {

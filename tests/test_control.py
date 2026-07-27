@@ -8,7 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gazeebo.control import ControlError, TrainingControl, request_training
+from gazeebo.control import (
+    ControlCommand,
+    ControlError,
+    TrainingControl,
+    request_command,
+    request_training,
+)
 
 
 class TrainingControlTests(unittest.TestCase):
@@ -29,6 +35,35 @@ class TrainingControlTests(unittest.TestCase):
             await control.close()
             await control.close()
             assert not path.exists()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(exercise(Path(temporary)))
+
+    def test_owner_accepts_only_bounded_refinement_commands(self) -> None:
+        """Validated grid and motion requests enter the process-local queue."""
+
+        async def exercise(root: Path) -> None:
+            queue: asyncio.Queue[ControlCommand] = asyncio.Queue()
+            path = root / "gazeebo" / "control.sock"
+            control = TrainingControl(asyncio.Event(), path, queue)
+            await control.start()
+            commands = (
+                ("refine", ControlCommand("refine")),
+                ("cell 9", ControlCommand("cell", label="9")),
+                ("cell ;", ControlCommand("cell", label=";")),
+                ("move -1.5 2", ControlCommand("move", (-1.5, 2.0))),
+                ("position 10 20", ControlCommand("position", (10.0, 20.0))),
+                ("accept", ControlCommand("accept")),
+                ("cancel", ControlCommand("cancel")),
+                ("capture", ControlCommand("capture")),
+            )
+            for text, expected in commands:
+                assert await request_command(text, path)
+                assert await queue.get() == expected
+            for invalid in ("cell aa", "cell é", "cell  ", "move nan 1", "unknown"):
+                with self.assertRaisesRegex(ControlError, "invalid"):
+                    await request_command(invalid, path)
+            await control.close()
 
         with tempfile.TemporaryDirectory() as temporary:
             asyncio.run(exercise(Path(temporary)))

@@ -107,6 +107,7 @@ class FakeHud:
     model_context: tuple[str, str, str] = ("unselected", "unknown", "unknown")
     noise_context: tuple[str, float, float] = ("default", 0.0, 0.0)
     evidence_context: str = "head+face"
+    refinement_context: str = "inactive"
     training_region: tuple[str, float, float, float, int, int, str] = (
         "inactive",
         0.0,
@@ -147,6 +148,10 @@ class FakeHud:
             context.mode,
         )
 
+    def set_refinement_context(self, context: str) -> None:
+        """Record bounded refinement diagnostics."""
+        self.refinement_context = context
+
     async def update(self, region_id: str, x: float, y: float) -> None:
         """Record one global pointer diagnostic."""
         self.updates.append((region_id, x, y))
@@ -165,6 +170,10 @@ class FakeTraining:
     preparations: list[tuple[str, float, float, float, str, float]] = field(default_factory=list)
     diagnostics: list[tuple[Frame, HeadTrackingFailure, float]] = field(default_factory=list)
     diagnostic_hides: int = 0
+    refinements: list[tuple[float, float, float, float, int, str, tuple[str, ...]]] = field(
+        default_factory=list
+    )
+    refinement_hides: int = 0
     diameters: dict[str, float] = field(default_factory=dict)
     closed: bool = False
 
@@ -207,6 +216,23 @@ class FakeTraining:
     def hide_head_diagnostic(self) -> None:
         """Record removal of transient diagnostic pixels."""
         self.diagnostic_hides += 1
+
+    def show_refinement(  # noqa: PLR0913
+        self,
+        left: float,
+        top: float,
+        width: float,
+        height: float,
+        depth: int,
+        source: str,
+        rows: tuple[str, ...],
+    ) -> None:
+        """Record one global recursive matrix."""
+        self.refinements.append((left, top, width, height, depth, source, rows))
+
+    def hide_refinement(self) -> None:
+        """Record clearing the recursive grid."""
+        self.refinement_hides += 1
 
     def target_diameter(
         self,

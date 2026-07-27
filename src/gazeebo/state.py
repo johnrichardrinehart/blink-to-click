@@ -14,7 +14,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import cast
 
-STORE_VERSION = 8
+STORE_VERSION = 9
+PRE_RESIDUAL_STORE_VERSION = 8
 PRE_CVAR_STORE_VERSION = 7
 PRE_SURPRISE_STORE_VERSION = 6
 PRE_FEATURE_DISPERSION_STORE_VERSION = 5
@@ -34,7 +35,8 @@ _FILE_MODE = 0o600
 _STORE_MAGIC = b"GZB1"
 _MAXIMUM_JSON_DEPTH = 64
 _OUTPUT_RECORD_LENGTH = 5
-_TARGET_RECORD_LENGTH = 16
+_TARGET_RECORD_LENGTH = 18
+_PRE_RESIDUAL_TARGET_RECORD_LENGTH = 16
 _PRE_SURPRISE_TARGET_RECORD_LENGTH = 14
 _PRE_FEATURE_DISPERSION_TARGET_RECORD_LENGTH = 13
 _NOISE_RECORD_LENGTH = 6
@@ -133,6 +135,8 @@ class StoredTarget:
     feature_dispersion: tuple[float, ...] = ()
     unseen_error: float | None = None
     predictive_uncertainty: float | None = None
+    horizontal_residual: float | None = None
+    vertical_residual: float | None = None
 
     def __post_init__(self) -> None:
         """Reject records that cannot be routed or remapped safely."""
@@ -164,8 +168,14 @@ class StoredTarget:
         if any(
             value is not None and (not math.isfinite(value) or value < 0.0)
             for value in (self.unseen_error, self.predictive_uncertainty)
+        ) or any(
+            value is not None and not math.isfinite(value)
+            for value in (self.horizontal_residual, self.vertical_residual)
         ):
             msg = "stored target surprise evidence is invalid"
+            raise ValueError(msg)
+        if (self.horizontal_residual is None) != (self.vertical_residual is None):
+            msg = "stored target component residuals must be paired"
             raise ValueError(msg)
         if not self.outputs or self.output_key not in {output.key for output in self.outputs}:
             msg = "stored target output is unavailable"
@@ -628,6 +638,8 @@ def _encode_compact_state(state: TrainingState) -> dict[str, object]:
                 list(target.feature_dispersion),
                 target.unseen_error,
                 target.predictive_uncertainty,
+                target.horizontal_residual,
+                target.vertical_residual,
             ]
         )
     clusters = [
@@ -764,7 +776,8 @@ def _decode_compact_target(
     record_length = {
         PRE_FEATURE_DISPERSION_STORE_VERSION: _PRE_FEATURE_DISPERSION_TARGET_RECORD_LENGTH,
         PRE_SURPRISE_STORE_VERSION: _PRE_SURPRISE_TARGET_RECORD_LENGTH,
-        PRE_CVAR_STORE_VERSION: _TARGET_RECORD_LENGTH,
+        PRE_CVAR_STORE_VERSION: _PRE_RESIDUAL_TARGET_RECORD_LENGTH,
+        PRE_RESIDUAL_STORE_VERSION: _PRE_RESIDUAL_TARGET_RECORD_LENGTH,
         STORE_VERSION: _TARGET_RECORD_LENGTH,
     }[version]
     item = _fixed_record(value, record_length, "target")
@@ -785,6 +798,8 @@ def _decode_compact_target(
         () if version == PRE_FEATURE_DISPERSION_STORE_VERSION else _float_tuple(item[13]),
         None if version < PRE_CVAR_STORE_VERSION else _optional_float(item[14]),
         None if version < PRE_CVAR_STORE_VERSION else _optional_float(item[15]),
+        None if version < STORE_VERSION else _optional_float(item[16]),
+        None if version < STORE_VERSION else _optional_float(item[17]),
     )
 
 
@@ -828,6 +843,7 @@ def _decode_compact_validation(
         PRE_FEATURE_DISPERSION_STORE_VERSION: _PRE_SURPRISE_VALIDATION_RECORD_LENGTH,
         PRE_SURPRISE_STORE_VERSION: _PRE_SURPRISE_VALIDATION_RECORD_LENGTH,
         PRE_CVAR_STORE_VERSION: _PRE_CVAR_VALIDATION_RECORD_LENGTH,
+        PRE_RESIDUAL_STORE_VERSION: _VALIDATION_RECORD_LENGTH,
         STORE_VERSION: _VALIDATION_RECORD_LENGTH,
     }[version]
     item = _fixed_record(value, record_length, "validation")
@@ -839,8 +855,8 @@ def _decode_compact_validation(
         _number(item[4]),
         _number(item[5]),
         0.0 if version < PRE_CVAR_STORE_VERSION else _number(item[6]),
-        None if version < STORE_VERSION else _optional_float(item[7]),
-        None if version < STORE_VERSION else _optional_float(item[8]),
+        None if version < PRE_RESIDUAL_STORE_VERSION else _optional_float(item[7]),
+        None if version < PRE_RESIDUAL_STORE_VERSION else _optional_float(item[8]),
     )
 
 
@@ -851,6 +867,7 @@ def _decode_compact_state(raw: dict[str, object]) -> TrainingState:
         PRE_FEATURE_DISPERSION_STORE_VERSION,
         PRE_SURPRISE_STORE_VERSION,
         PRE_CVAR_STORE_VERSION,
+        PRE_RESIDUAL_STORE_VERSION,
         STORE_VERSION,
     }:
         msg = "training store version is unsupported"
@@ -897,6 +914,7 @@ def _decode_state(value: object) -> TrainingState:
         PRE_FEATURE_DISPERSION_STORE_VERSION,
         PRE_SURPRISE_STORE_VERSION,
         PRE_CVAR_STORE_VERSION,
+        PRE_RESIDUAL_STORE_VERSION,
     ):
         raw = {**raw, "version": STORE_VERSION}
     elif version != STORE_VERSION:
@@ -939,6 +957,8 @@ def _decode_target(value: object) -> StoredTarget:
         feature_dispersion=_float_tuple(raw.get("feature_dispersion", [])),
         unseen_error=_optional_float(raw.get("unseen_error")),
         predictive_uncertainty=_optional_float(raw.get("predictive_uncertainty")),
+        horizontal_residual=_optional_float(raw.get("horizontal_residual")),
+        vertical_residual=_optional_float(raw.get("vertical_residual")),
     )
 
 

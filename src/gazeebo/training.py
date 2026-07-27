@@ -229,6 +229,8 @@ class TargetMeasurement:
     noise_spread: float = 0.0
     predictive_uncertainty: float | None = None
     region: str = ""
+    horizontal_residual: float | None = None
+    vertical_residual: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +290,8 @@ class CollectedTarget:
     feature_dispersion: FeatureVector = ()
     unseen_error: float | None = None
     predictive_uncertainty: float | None = None
+    horizontal_residual: float | None = None
+    vertical_residual: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +385,21 @@ class _NativeTrainingSurface:
             ctypes.c_size_t,
         ]
         library.gazeebo_training_show_target.restype = ctypes.c_int
+        library.gazeebo_training_show_grid.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_int32,
+            ctypes.c_char_p,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        library.gazeebo_training_show_grid.restype = ctypes.c_int
         library.gazeebo_training_show_message.argtypes = [
             ctypes.c_void_p,
             ctypes.c_char_p,
@@ -472,6 +491,39 @@ class _NativeTrainingSurface:
         if result != 0:
             detail = error_buffer.value.decode(errors="replace") or "unknown Wayland error"
             msg = f"calibration training update failed: {detail}"
+            raise TrainingError(msg)
+
+    def show_grid(  # noqa: PLR0913
+        self,
+        left: float,
+        top: float,
+        width: float,
+        height: float,
+        depth: int,
+        source: str,
+        rows: tuple[str, ...],
+    ) -> None:
+        """Render one output-local intersection of the refinement matrix."""
+        if self._closed:
+            return
+        error_buffer = ctypes.create_string_buffer(TRAINING_ERROR_SIZE)
+        result = self._library.gazeebo_training_show_grid(
+            self._handle,
+            left,
+            top,
+            width,
+            height,
+            depth,
+            source.encode(),
+            len(rows),
+            len(rows[0]),
+            "".join(rows).encode("ascii"),
+            error_buffer,
+            TRAINING_ERROR_SIZE,
+        )
+        if result != 0:
+            detail = error_buffer.value.decode(errors="replace") or "unknown Wayland error"
+            msg = f"refinement grid update failed: {detail}"
             raise TrainingError(msg)
 
     def show_message(self, label: str) -> None:
@@ -655,6 +707,38 @@ class LayerShellTraining:
             return
         for surface in self._surfaces.values():
             surface.show_message(label)
+
+    def show_refinement(  # noqa: PLR0913
+        self,
+        left: float,
+        top: float,
+        width: float,
+        height: float,
+        depth: int,
+        source: str,
+        rows: tuple[str, ...],
+    ) -> None:
+        """Show one global matrix across every intersecting authorized output."""
+        if self._closed:
+            return
+        for identifier, surface in self._surfaces.items():
+            region = self._regions[identifier]
+            surface.show_grid(
+                left - region.x,
+                top - region.y,
+                width,
+                height,
+                depth,
+                source,
+                rows,
+            )
+
+    def hide_refinement(self) -> None:
+        """Clear every active refinement surface."""
+        if self._closed:
+            return
+        for surface in self._surfaces.values():
+            surface.hide()
 
     def show_preparation(  # noqa: PLR0913
         self,
@@ -1448,6 +1532,8 @@ async def _validate(  # noqa: PLR0913
             feature_dispersion,
             result.measurement.radial_error,
             result.measurement.predictive_uncertainty,
+            result.measurement.horizontal_residual,
+            result.measurement.vertical_residual,
         )
         collected.append(completed_target)
         if completed_target_sink is not None:
@@ -1602,6 +1688,8 @@ async def _collect_target(  # noqa: PLR0913
                 if any(item[5] is not None for item in window)
                 else None
             ),
+            horizontal_residual=statistics.median(item[2].x - target_global.x for item in window),
+            vertical_residual=statistics.median(item[2].y - target_global.y for item in window),
         ),
         TargetMeasurement(
             radial_error=statistics.median(item[4] for item in window),

@@ -58,6 +58,8 @@ def make_stored_target(  # noqa: PLR0913
     feature_dispersion: FeatureVector = (),
     unseen_error: float | None = None,
     predictive_uncertainty: float | None = None,
+    horizontal_residual: float | None = None,
+    vertical_residual: float | None = None,
 ) -> StoredTarget:
     """Represent one current target in output-local and topology-relative space."""
     region = topology.region(target.region_id)
@@ -80,6 +82,8 @@ def make_stored_target(  # noqa: PLR0913
         feature_dispersion=feature_dispersion,
         unseen_error=unseen_error,
         predictive_uncertainty=predictive_uncertainty,
+        horizontal_residual=horizontal_residual,
+        vertical_residual=vertical_residual,
     )
 
 

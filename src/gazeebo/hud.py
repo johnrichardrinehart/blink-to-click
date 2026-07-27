@@ -109,6 +109,7 @@ class LayerShellDebugHud:
         self._noise_dead_zone = 0.0
         self._evidence = "head+face"
         self._training_region = "inactive"
+        self._refinement = "inactive"
         self._closed = False
 
     @classmethod
@@ -148,6 +149,10 @@ class LayerShellDebugHud:
             f"({context.observed_regions}/{context.total_regions})"
         )
 
+    def set_refinement_context(self, context: str) -> None:
+        """Retain bounded refinement state for the next redraw."""
+        self._refinement = context
+
     async def update(self, region_id: str, x: float, y: float) -> None:
         """Replace the HUD content at most once per one-second interval."""
         if self._closed:
@@ -162,7 +167,8 @@ class LayerShellDebugHud:
                 f"{region_id}; authorized: {authorized}; "
                 f"model: {self._routing}; confidence: {self._model_confidence}; "
                 f"topology: {self._topology_quality}; evidence: {self._evidence}; "
-                f"training: {self._training_region}; noise: {self._noise_confidence}; "
+                f"training: {self._training_region}; refinement: {self._refinement}; "
+                f"noise: {self._noise_confidence}; "
                 f"alpha: {self._noise_alpha:.2f}; dead-zone: {self._noise_dead_zone:.1f}px"
             )
         self._surface.show(displayed_region, x, y)

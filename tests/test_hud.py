@@ -43,13 +43,15 @@ class HudTests(unittest.TestCase):
         hud.set_training_region(
             TrainingRegionStatus("display-c:2,2", 2.25, 1.25, 3.50, 17, 27, "high-surprise")
         )
+        hud.set_refinement_context("3x4 depth 2 cell 'k' settling")
         asyncio.run(hud.update("display-b", 300.0, 400.0))
         assert surface.updates == [
             (
                 "display-b; authorized: display-a, display-b, display-c; "
                 "model: global+context-4; confidence: inferred-weak; topology: weak; "
                 "evidence: head+face; training: display-c:2,2 high-surprise CVaR90 "
-                "2.25 1.25..3.50 (17/27); noise: inferred-compatible; alpha: 0.20; "
+                "2.25 1.25..3.50 (17/27); refinement: 3x4 depth 2 cell 'k' "
+                "settling; noise: inferred-compatible; alpha: 0.20; "
                 "dead-zone: 12.0px",
                 300.0,
                 400.0,

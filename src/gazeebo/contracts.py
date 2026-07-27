@@ -38,6 +38,10 @@ class RuntimeStatus(Enum):
     MODEL_ERROR = "model-error"
     STORE_ERROR = "store-error"
     ACTIVE = "active"
+    ROUGH_IN = "rough-in"
+    REFINEMENT = "refinement"
+    REFINEMENT_SETTLED = "refinement-settled"
+    INPUT_CAPTURE = "input-capture"
     RECALIBRATION_REQUIRED = "recalibration-required"
     CAMERA_ERROR = "camera-error"
     INPUT_ERROR = "input-error"
@@ -232,6 +236,9 @@ class DebugHud(Protocol):
     def set_training_region(self, context: TrainingRegionStatus) -> None:
         """Report bounded region-aware target selection without feature values."""
 
+    def set_refinement_context(self, context: str) -> None:
+        """Report bounded matrix, confidence, and settlement state."""
+
     async def update(self, region_id: str, x: float, y: float) -> None:
         """Show the current authorized region and global logical coordinate."""
 
@@ -255,6 +262,37 @@ class HeadDiagnosticSurface(Protocol):
 
     async def close(self) -> None:
         """Remove the diagnostic surface and release it idempotently."""
+
+
+class InputCaptureSession(Protocol):
+    """Own one optional portal-authorized physical pointer capture."""
+
+    barrier_count: int
+
+    async def close(self) -> None:
+        """Release the portal and EIS resources idempotently."""
+
+
+class RefinementSurface(Protocol):
+    """Show one transient click-through recursive character matrix."""
+
+    def show_refinement(  # noqa: PLR0913
+        self,
+        left: float,
+        top: float,
+        width: float,
+        height: float,
+        depth: int,
+        source: str,
+        rows: tuple[str, ...],
+    ) -> None:
+        """Show labelled matrix geometry intersected with authorized outputs."""
+
+    def hide_refinement(self) -> None:
+        """Clear the active refinement grid."""
+
+    async def close(self) -> None:
+        """Destroy every refinement surface idempotently."""
 
 
 class TrainingSurface(HeadDiagnosticSurface, Protocol):

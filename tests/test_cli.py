@@ -14,6 +14,8 @@ from gazeebo.cli import (
     _camera_device,
     _load_startup_inputs,
     _open_startup_resources,
+    _refinement_command,
+    _refinement_config,
     build_parser,
     main,
 )
@@ -68,6 +70,26 @@ class CliTests(unittest.TestCase):
         statistics = json.loads(stats_output.getvalue())
         assert statistics["schema_version"] >= 5
         assert statistics["target_count"] == 0
+
+    def test_refinement_commands_map_to_bounded_socket_protocol(self) -> None:
+        """CLI cell and motion values become explicit owner requests."""
+        arguments = build_parser().parse_args(["refine-cell", ";"])
+        assert _refinement_command(arguments.command, arguments.control_values) == "cell ;"
+        arguments = build_parser().parse_args(["refine-move", "-2.5", "3"])
+        assert _refinement_command(arguments.command, arguments.control_values) == "move -2.5 3"
+        with self.assertRaises(ValueError):
+            _refinement_command("refine-cell", ())
+        configured = build_parser().parse_args(
+            [
+                "--refinement-row",
+                "i,.p",
+                "--refinement-row",
+                "aoeu",
+                "--refinement-row",
+                ";qjk",
+            ]
+        )
+        assert _refinement_config(configured).rows == ("i,.p", "aoeu", ";qjk")
 
     def test_training_commands_do_not_expose_profiles(self) -> None:
         """Users request training or reset one automatic local corpus."""

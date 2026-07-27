@@ -44,6 +44,11 @@ from gazeebo.geometry import (
     rolling_point_median,
 )
 from gazeebo.recovery import HeadTrackingError, observe_with_head_recovery
+from gazeebo.refinement import (
+    ConfidenceRegionEstimator,
+    RefinementConfig,
+    RefinementController,
+)
 from gazeebo.state import (
     MAXIMUM_MODEL_ANCHORS,
     ModelAnchor,
@@ -75,12 +80,14 @@ if TYPE_CHECKING:
         DisplayRegion,
         FeatureVector,
         HeadDiagnosticSurface,
+        InputCaptureSession,
         PointerController,
+        RefinementSurface,
         StatusSink,
         TrainingSurface,
         VisionEstimator,
     )
-    from gazeebo.control import TrainingControl
+    from gazeebo.control import ControlCommand, TrainingControl
     from gazeebo.display import DisplayMonitor, OutputGeometry
 
 FEATURE_SCHEMA = "gaze-v4"
@@ -214,6 +221,15 @@ async def run_owned_session(  # noqa: C901, PLR0912, PLR0913, PLR0915
     diagnostic_factory: Callable[[Sequence[DisplayRegion]], HeadDiagnosticSurface] | None = None,
     training_control: TrainingControl | None = None,
     display_monitor: DisplayMonitor | None = None,
+    refinement_config: RefinementConfig | None = None,
+    refinement_factory: Callable[[Sequence[DisplayRegion]], RefinementSurface] | None = None,
+    input_capture_authorizer: (
+        Callable[
+            [Callable[[int, float, float], None], Callable[[str], None]],
+            Awaitable[InputCaptureSession],
+        ]
+        | None
+    ) = None,
     feature_schema: str = FEATURE_SCHEMA,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -224,6 +240,8 @@ async def run_owned_session(  # noqa: C901, PLR0912, PLR0913, PLR0915
     head_diagnostic_factory = diagnostic_factory or training_factory
     state = training_state or TrainingState()
     persist_completed_targets = training_store is not None and training is not None
+    active_refinement_config = refinement_config or RefinementConfig()
+    refinement_controller: RefinementController | None = None
 
     def retain_completed_target(target: CollectedTarget) -> None:
         nonlocal state
@@ -403,6 +421,25 @@ async def run_owned_session(  # noqa: C901, PLR0912, PLR0913, PLR0915
 
         _set_hud_model_context(hud, model)
         while True:
+            if refinement_controller is not None:
+                await refinement_controller.close()
+            refinement_controller = RefinementController(
+                topology,
+                ConfidenceRegionEstimator(
+                    topology,
+                    state.targets,
+                    camera_id=camera.camera_id,
+                    feature_schema=feature_schema,
+                    config=active_refinement_config,
+                ),
+                pointer,
+                status,
+                refinement_factory,
+                config=active_refinement_config,
+                sleep=sleep,
+                hud=hud,
+                capture_authorizer=input_capture_authorizer,
+            )
             status.report(RuntimeStatus.ACTIVE)
             result = await _track(
                 camera,
@@ -422,6 +459,8 @@ async def run_owned_session(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 _diagnostic_factory(head_diagnostic_factory),
                 clock,
                 sleep,
+                refinement=refinement_controller,
+                commands=(None if training_control is None else training_control.command_queue),
             )
             if result != TRAINING_REQUESTED_RESULT:
                 return result
@@ -512,6 +551,8 @@ async def run_owned_session(  # noqa: C901, PLR0912, PLR0913, PLR0915
             finally:
                 await active_training.close()
     finally:
+        if refinement_controller is not None:
+            await refinement_controller.close()
         vision.close()
         camera.close()
         if training is not None:
@@ -824,6 +865,16 @@ async def _calibrate(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 predictive_uncertainty=(
                     statistics.median(unseen_uncertainties) if unseen_uncertainties else None
                 ),
+                horizontal_residual=(
+                    statistics.median(point.x - global_target.x for point in unseen_predictions)
+                    if unseen_predictions
+                    else None
+                ),
+                vertical_residual=(
+                    statistics.median(point.y - global_target.y for point in unseen_predictions)
+                    if unseen_predictions
+                    else None
+                ),
             )
             collected.append(completed_target)
             if completed_target_sink is not None:
@@ -1039,6 +1090,8 @@ def _append_unvalidated_target(  # noqa: PLR0913
         target.feature_dispersion,
         target.unseen_error,
         target.predictive_uncertainty,
+        target.horizontal_residual,
+        target.vertical_residual,
     )
     add_target(candidate, persistent)
     store.save(candidate)
@@ -1112,6 +1165,8 @@ def _persist_targets(  # noqa: PLR0913
             collected.feature_dispersion,
             collected.unseen_error,
             collected.predictive_uncertainty,
+            collected.horizontal_residual,
+            collected.vertical_residual,
         )
         assigned_clusters.append(add_target(candidate, persistent))
     if accepted and validated_model is not None:
@@ -1261,7 +1316,24 @@ async def _track(  # noqa: C901, PLR0912, PLR0913, PLR0915
     diagnostic_factory: Callable[[Sequence[DisplayRegion]], HeadDiagnosticSurface],
     clock: Callable[[], float],
     sleep: Callable[[float], Awaitable[None]],
+    *,
+    refinement: RefinementController | None = None,
+    commands: asyncio.Queue[ControlCommand] | None = None,
 ) -> int:
+    active_refinement = refinement or RefinementController(
+        topology,
+        ConfidenceRegionEstimator(
+            topology,
+            state.targets,
+            camera_id=camera_id,
+            feature_schema=feature_schema,
+        ),
+        pointer,
+        status,
+        None,
+        config=RefinementConfig(),
+        sleep=sleep,
+    )
     smoother = PointerSmoother(
         alpha=tracking.smoothing_alpha,
         dead_zone=tracking.smoothing_dead_zone,
@@ -1286,6 +1358,10 @@ async def _track(  # noqa: C901, PLR0912, PLR0913, PLR0915
         sorted((region.x, region.y, region.width, region.height) for region in topology.regions)
     )
     while not stop.is_set():
+        if commands is not None:
+            while not commands.empty():
+                command = commands.get_nowait()
+                await active_refinement.handle(command)
         if training_requested is not None and training_requested.is_set():
             return TRAINING_REQUESTED_RESULT
         if bool(getattr(pointer, "closed", False)):
@@ -1368,12 +1444,13 @@ async def _track(  # noqa: C901, PLR0912, PLR0913, PLR0915
             routing_context,
         )
         rendered = rolling_point_median(rendered_predictions, estimated)
+        active_refinement.update_rough(rendered)
         pointer_due = (
             last_pointer_update is None
             or observation.timestamp - last_pointer_update
             >= tracking.pointer_update_interval_seconds
         )
-        if pointer_due:
+        if pointer_due and not active_refinement.held:
             smoother.alpha = _uncertainty_adjusted_alpha(
                 base_smoothing_alpha,
                 tracking.noise_minimum_alpha,

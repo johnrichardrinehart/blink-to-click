@@ -4,28 +4,46 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 _DIRECTORY_MODE = 0o700
 _SOCKET_MODE = 0o600
+_MAXIMUM_COMMAND_BYTES = 256
+_MAXIMUM_PENDING_COMMANDS = 64
+_CELL_FIELD_COUNT = 2
+_MOTION_FIELD_COUNT = 3
+_REFINEMENT_COMMANDS = {"refine", "accept", "cancel", "capture"}
 
 
 class ControlError(RuntimeError):
     """The local training-control channel is unsafe or unavailable."""
 
 
+@dataclass(frozen=True, slots=True)
+class ControlCommand:
+    """One validated process-local cursor-refinement request."""
+
+    kind: str
+    values: tuple[float, ...] = ()
+    label: str = ""
+
+
 class TrainingControl:
-    """Own one process-scoped Unix socket that accepts a training request."""
+    """Own one process-scoped Unix socket for training and refinement."""
 
     def __init__(
         self,
         training_requested: asyncio.Event,
         path: Path | None = None,
+        command_queue: asyncio.Queue[ControlCommand] | None = None,
     ) -> None:
-        """Bind one training event to an optional testable socket path."""
+        """Bind training and refinement requests to one testable socket."""
         self.training_requested = training_requested
+        self.command_queue = command_queue or asyncio.Queue(_MAXIMUM_PENDING_COMMANDS)
         self.path = path or control_path()
         self._server: asyncio.Server | None = None
         self._owns_path = False
@@ -74,12 +92,19 @@ class TrainingControl:
         writer: asyncio.StreamWriter,
     ) -> None:
         try:
-            command = await asyncio.wait_for(reader.readline(), 2.0)
-            if command == b"train\n":
+            raw = await asyncio.wait_for(reader.readline(), 2.0)
+            if len(raw) > _MAXIMUM_COMMAND_BYTES:
+                writer.write(b"rejected\n")
+            elif raw == b"train\n":
                 self.training_requested.set()
                 writer.write(b"accepted\n")
             else:
-                writer.write(b"rejected\n")
+                command = _parse_command(raw)
+                if command is None or self.command_queue.full():
+                    writer.write(b"rejected\n")
+                else:
+                    self.command_queue.put_nowait(command)
+                    writer.write(b"accepted\n")
             await writer.drain()
         finally:
             writer.close()
@@ -88,6 +113,15 @@ class TrainingControl:
 
 async def request_training(path: Path | None = None) -> bool:
     """Request training from an existing process, returning false when absent."""
+    return await request_command("train", path)
+
+
+async def request_command(command: str, path: Path | None = None) -> bool:
+    """Send one bounded command to an existing foreground owner."""
+    encoded = f"{command}\n".encode()
+    if len(encoded) > _MAXIMUM_COMMAND_BYTES or _parse_client_command(command) is None:
+        msg = "Gazeebo control command is invalid"
+        raise ControlError(msg)
     target = path or control_path()
     if not target.exists() and not target.is_symlink():
         return False
@@ -99,13 +133,44 @@ async def request_training(path: Path | None = None) -> bool:
         target.unlink()
         return False
     try:
-        writer.write(b"train\n")
+        writer.write(encoded)
         await writer.drain()
         response = await asyncio.wait_for(reader.readline(), 2.0)
         return response == b"accepted\n"
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+def _parse_client_command(command: str) -> ControlCommand | str | None:
+    if command == "train":
+        return command
+    return _parse_command(f"{command}\n".encode())
+
+
+def _parse_command(raw: bytes) -> ControlCommand | None:  # noqa: PLR0911
+    try:
+        fields = raw.decode("ascii").strip().split()
+    except UnicodeDecodeError:
+        return None
+    if not fields:
+        return None
+    kind = fields[0]
+    if kind in _REFINEMENT_COMMANDS and len(fields) == 1:
+        return ControlCommand(kind)
+    if kind == "cell" and len(fields) == _CELL_FIELD_COUNT:
+        label = fields[1]
+        if len(label) == 1 and label.isascii() and label.isprintable() and not label.isspace():
+            return ControlCommand(kind, label=label)
+        return None
+    if kind in {"move", "position"} and len(fields) == _MOTION_FIELD_COUNT:
+        try:
+            values = tuple(float(value) for value in fields[1:])
+        except ValueError:
+            return None
+        if all(math.isfinite(value) for value in values):
+            return ControlCommand(kind, values)
+    return None
 
 
 def control_path() -> Path:

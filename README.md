@@ -10,6 +10,8 @@ Gazeebo needs:
 - a Wayland session with layer shell for initial and on-demand target training;
 - a locally attached camera supported by OpenCV and V4L2.
 
+Optional physical or keyboard-layer pointer refinement uses XDG InputCapture and libei when the portal supports pointer capture. Owner-only socket motion reports remain available on every supported desktop.
+
 The portal selector defines the authorized displays. Gazeebo does not read compositor configuration or invoke a window-manager command. A portal backend that omits multi-display positions fails safely.
 
 ## Run
@@ -28,6 +30,36 @@ Startup concurrently loads local training state and vision resources while reque
 On the first run, Gazeebo collects five deterministic seed targets across the authorized displays to establish a finite model. It predicts every subsequent target with a model that has not seen that target, incorporates the result immediately, and selects the next target from the updated model and region evidence. It saves every completed target aggregate. Later runs passively select or blend automatic context experts and begin navigation without mandatory target validation. During navigation, Gazeebo refreshes available output geometry and camera context once per second by default. It applies topology first, posture and camera geometry second, and illumination last. Model routing therefore follows mid-session posture and lighting changes instead of remaining fixed at startup.
 
 Predictions can cross authorized displays. Predictions in desktop gaps or outside the selected union project to the nearest authorized display. Motion defaults to snapping to a 15-position rolling median of model coordinates sampled at camera cadence, emitted at most once every 100 milliseconds. This rejects isolated stationary jumps without reintroducing slow cursor transit. A finite 10,000-pixel step bound and noise-adaptive dead zone remain active; smoothing alpha and step size are configurable. `--pointer-update-interval 0` requests continuous updates. A display addition pauses and refreshes portal authorization by default. `--no-allow-display-reauthorization-pause` keeps the existing authorized union after additions, but it can never authorize a new output or retain invalid geometry.
+
+## Refine a rough position
+
+Gaze is a rough-in signal. A user first presses Return or another configured key sequence in an external keyboard layer. That binding invokes `gazeebo refine-start`, which pins the latest authorized gaze position and opens a click-through, keyboard-inactive refinement matrix. Gazeebo does not capture the key itself, so the key binding remains desktop-independent and configurable:
+
+```console
+gazeebo refine-start
+gazeebo refine-cell 1       # select the displayed default top-left label
+gazeebo refine-cell 5       # recurse through the displayed default center label
+gazeebo refine-accept       # hold the current center for manual refinement
+gazeebo refine-move -8 3    # bounded relative logical motion
+gazeebo refine-position 640 480
+gazeebo refine-capture      # optional barrier-activated XDG InputCapture/libei path
+gazeebo refine-cancel       # release the hold and resume gaze motion
+```
+
+The default matrix is `["123", "456", "789"]`. Configure a rectangular keyboard layout with two through six rows and columns in `$XDG_CONFIG_HOME/gazeebo/config.toml` (or `~/.config/gazeebo/config.toml`):
+
+```toml
+[refinement]
+rows = ["i,.p", "aoeu", ";qjk"]
+```
+
+Repeat `--refinement-row` to replace the complete configured matrix for one foreground invocation, for example `gazeebo --refinement-row 'i,.p' --refinement-row aoeu --refinement-row ';qjk'`. Rows must have equal length. All 4–36 labels must be distinct printable non-whitespace ASCII characters. Configured labels replace numeric selection tokens completely, so the example uses commands such as `gazeebo refine-cell i` and `gazeebo refine-cell ';'`; numeric aliases do not remain.
+
+The active foreground process accepts these commands through its owner-only Unix socket. The start command is the pinning boundary: gaze motion stops, the current rough position remains fixed, and the configured refinement flow begins. It centers a confidence rectangle on that rough estimate. Explicit finite `--rough-in-width` and `--rough-in-height` values override measured dimensions independently. Otherwise each full dimension is twice the empirical p99 absolute signed component residual, resolved from the current output-relative 3×3 training region, output, or global compatible evidence. Sparse component evidence falls back to conservative legacy radial evidence and then authorized topology bounds. Status and the matrix identify the source, sample count, fallback, topology clipping, and authorized-union intersection.
+
+Each character selection moves only to its row-and-column cell's projected center and redraws the same matrix recursively. `--refinement-maximum-depth` and `--refinement-minimum-cell-size` provide finite recursion limits. Selection and acceptance never click, press a button, scroll, drag, or emit a key. All positions project into the portal-authorized union.
+
+After grid acceptance, the final recursive rectangle follows each relative or absolute transient position and remains visible until that position settles. Each update redraws the rectangle and restarts `--refinement-settle-seconds`, 500 ms by default. Settlement hides the rectangle and reports only the latest point. Gazeebo never stores the trajectory or turns it into training evidence. InputCapture is optional because the portal can deny it and can activate it only after a compositor-approved boundary barrier is crossed; denial, unsupported capability, or EIS disconnection reports the socket fallback without stopping navigation.
 
 ## Add training data
 
@@ -76,7 +108,7 @@ The default precision threshold is 100 logical pixels and one invocation stops e
 
 Users do not create or select profiles. Gazeebo keeps one automatic store below `$XDG_DATA_HOME/gazeebo`, or `$HOME/.local/share/gazeebo` when `XDG_DATA_HOME` is unset.
 
-Every completed target remains in the store until reset. Each compact record contains median head/face and optional pupil features, per-feature robust dispersion, explicit pupil availability, posture and illumination context, the true output-relative circle center, monitor topology, a finite cursor-noise summary, and optional pre-incorporation radial error and posterior uncertainty. Legacy records remain model evidence but do not gain invented surprise measurements. Repeated camera, schema, output, and topology descriptors are interned; positional records avoid repeated keys; and the payload uses lossless standard compression. A 10,000-target regression fixture stays below 1 KiB per target on disk. The store also contains context statistics, fitted coefficients, and aggregate validation results.
+Every completed target remains in the store until reset. Each compact record contains median head/face and optional pupil features, per-feature robust dispersion, explicit pupil availability, posture and illumination context, the true output-relative circle center, monitor topology, a finite cursor-noise summary, and optional pre-incorporation radial error, paired signed horizontal and vertical residuals, and posterior uncertainty. Legacy records remain model evidence but do not gain invented surprise measurements. Repeated camera, schema, output, and topology descriptors are interned; positional records avoid repeated keys; and the payload uses lossless standard compression. A 10,000-target regression fixture stays below 1 KiB per target on disk. The store also contains context statistics, fitted coefficients, and aggregate validation results.
 
 The training store never contains frames, diagnostic images, video, raw frame-level landmarks, preparation observations, or per-frame cursor positions. Warning-triggered frames and detector metadata, when enabled, live only in the separate diagnostic archive described above. The training directory and file are owner-only, updates replace the complete state atomically, and decoding enforces compressed and expanded size limits.
 
@@ -109,13 +141,13 @@ gazeebo --ephemeral
 gazeebo --debug-hud
 ```
 
-The opt-in HUD lists every authorized region, the active region, global cursor coordinates, selected model blend, topology quality, selected training cell, CVaR90, and surprise interval, region coverage, and aggregate noise/smoothing class. It is transparent, read-only, always on top, click-through, and limited to one update per second. It never displays stored feature values or trajectories.
+The opt-in HUD lists every authorized region, the active region, global cursor coordinates, selected model blend, topology quality, selected training cell, CVaR90 and surprise interval, region coverage, active refinement matrix/pin/selection/settle state, and aggregate noise/smoothing class. It is transparent, read-only, always on top, click-through, and limited to one update per second. It never displays stored feature values or trajectories.
 
 ## Privacy and lifecycle
 
 Gazeebo has no telemetry, cloud client, or continuous recording path. Frames and frame-level derived values stay in memory and are discarded after processing except for default-enabled, warning-triggered diagnostic events. Those events remain local, owner-only, quota-bounded, and separate from the training store until `reset-diagnostics`. Only documented finite target-level aggregates enter the local training store. Every historical aggregate is retained until reset, so the compact private store grows with additional training.
 
-One foreground process owns the camera, portal session, models, native surfaces, and runtime socket. Normal exit, errors, `SIGINT`, and `SIGTERM` release them through the same cleanup path.
+One foreground process owns the camera, RemoteDesktop and optional InputCapture portal sessions, EIS receiver, models, native surfaces, settle timers, and runtime socket. Normal exit, errors, `SIGINT`, and `SIGTERM` release them through the same cleanup path.
 
 ## Development
 

@@ -12,7 +12,7 @@ from gazeebo import __version__
 from gazeebo.camera import CameraError, OpenCVCamera
 from gazeebo.contexts import build_router
 from gazeebo.contracts import RuntimeStatus
-from gazeebo.control import ControlError, TrainingControl, request_training
+from gazeebo.control import ControlError, TrainingControl, request_command, request_training
 from gazeebo.diagnostics import (
     CapturingVisionEstimator,
     DiagnosticArchive,
@@ -24,7 +24,9 @@ from gazeebo.diagnostics import (
 from gazeebo.display import DisplayMonitorError, NativeDisplayMonitor
 from gazeebo.geometry import DisplayTopology
 from gazeebo.hud import LayerShellDebugHud
+from gazeebo.input_capture import PortalInputCapture
 from gazeebo.portal import PortalError, PortalPointerController
+from gazeebo.refinement import RefinementConfig, refinement_rows
 from gazeebo.runtime import (
     DISPLAY_REAUTHORIZATION_RESULT,
     FEATURE_SCHEMA,
@@ -61,9 +63,17 @@ def build_parser() -> argparse.ArgumentParser:
             "training-stats",
             "reset-diagnostics",
             "diagnostic-stats",
+            "refine-start",
+            "refine-cell",
+            "refine-accept",
+            "refine-cancel",
+            "refine-capture",
+            "refine-move",
+            "refine-position",
         ),
         default="run",
     )
+    parser.add_argument("control_values", nargs="*")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--camera", help="V4L2 device path or numeric index")
     parser.add_argument(
@@ -101,6 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--training-countdown-interval", type=float, default=1.0)
     parser.add_argument("--training-completion-seconds", type=float, default=2.0)
     parser.add_argument("--context-refresh-interval", type=float, default=1.0)
+    parser.add_argument("--rough-in-width", type=float)
+    parser.add_argument("--rough-in-height", type=float)
+    parser.add_argument("--rough-in-minimum-samples", type=int, default=100)
+    parser.add_argument("--refinement-maximum-depth", type=int, default=6)
+    parser.add_argument("--refinement-minimum-cell-size", type=float, default=12.0)
+    parser.add_argument("--refinement-settle-seconds", type=float, default=0.5)
+    parser.add_argument(
+        "--refinement-row",
+        action="append",
+        help="replace the refinement matrix with complete repeated row strings",
+    )
     parser.add_argument("--noise-minimum-alpha", type=float, default=1.0)
     parser.add_argument("--noise-maximum-alpha", type=float, default=1.0)
     parser.add_argument("--noise-minimum-dead-zone", type=float, default=2.0)
@@ -179,6 +200,18 @@ def _training_config(arguments: argparse.Namespace) -> TrainingConfig:
         fallback_target_diameter=arguments.training_fallback_diameter,
         countdown_interval_seconds=arguments.training_countdown_interval,
         completion_seconds=arguments.training_completion_seconds,
+    )
+
+
+def _refinement_config(arguments: argparse.Namespace) -> RefinementConfig:
+    return RefinementConfig(
+        width_override=arguments.rough_in_width,
+        height_override=arguments.rough_in_height,
+        minimum_samples=arguments.rough_in_minimum_samples,
+        maximum_depth=arguments.refinement_maximum_depth,
+        minimum_cell_size=arguments.refinement_minimum_cell_size,
+        settle_seconds=arguments.refinement_settle_seconds,
+        rows=refinement_rows(arguments.refinement_row),
     )
 
 
@@ -314,6 +347,7 @@ async def _run_session(  # noqa: C901
     """Own one portal authorization epoch inside the foreground process."""
     tracking = _tracking_config(arguments)
     training_config = _training_config(arguments)
+    refinement_config = _refinement_config(arguments)
     training_requested = asyncio.Event()
     control = TrainingControl(training_requested)
     pointer: PortalPointerController | None = None
@@ -359,6 +393,9 @@ async def _run_session(  # noqa: C901
             diagnostic_factory=LayerShellTraining.create,
             training_control=control,
             display_monitor=monitor,
+            refinement_config=refinement_config,
+            refinement_factory=LayerShellTraining.create,
+            input_capture_authorizer=PortalInputCapture.authorize,
         )
     finally:
         if not session_started:
@@ -377,7 +414,31 @@ async def _run_session(  # noqa: C901
                 await pointer.close()
 
 
-async def _run(arguments: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912
+def _refinement_command(command: str, values: Sequence[str]) -> str | None:
+    """Translate explicit CLI refinement commands into socket protocol lines."""
+    fixed = {
+        "refine-start": ("refine", 0),
+        "refine-cell": ("cell", 1),
+        "refine-accept": ("accept", 0),
+        "refine-cancel": ("cancel", 0),
+        "refine-capture": ("capture", 0),
+        "refine-move": ("move", 2),
+        "refine-position": ("position", 2),
+    }
+    specification = fixed.get(command)
+    if specification is None:
+        if values:
+            msg = "control values require a refinement command"
+            raise ValueError(msg)
+        return None
+    name, count = specification
+    if len(values) != count:
+        msg = f"{command} requires {count} value(s)"
+        raise ValueError(msg)
+    return " ".join((name, *values))
+
+
+async def _run(arguments: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915
     """Run one foreground process across any required authorization epochs."""
     status = ConsoleStatus()
     status.report(RuntimeStatus.STARTING)
@@ -435,6 +496,13 @@ async def _run(arguments: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PL
         if arguments.command == "train" and await request_training():
             status.report(RuntimeStatus.STOPPED, "active session accepted training request")
             return 0
+        refinement_command = _refinement_command(arguments.command, arguments.control_values)
+        if refinement_command is not None:
+            if await request_command(refinement_command):
+                status.report(RuntimeStatus.STOPPED, "active session accepted refinement request")
+                return 0
+            status.report(RuntimeStatus.INPUT_ERROR, "no active Gazeebo owner")
+            return 2
         status.report(RuntimeStatus.LOADING)
         train_requested = arguments.command == "train"
         while not stop.is_set():

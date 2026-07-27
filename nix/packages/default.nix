@@ -24,6 +24,7 @@ let
     ];
     buildInputs = [
       pkgs.cairo
+      pkgs.libei
       pkgs.pango
       pkgs.wayland
     ];
@@ -52,11 +53,12 @@ let
       $CC -shared -fPIC -O2 -Wall -Wextra -Werror \
         -I"$hudBuildDir" \
         src/hud_native.c \
+        src/input_native.c \
         "$hudBuildDir/wlr-layer-shell-unstable-v1-protocol.c" \
         "$hudBuildDir/xdg-shell-protocol.c" \
         "$hudBuildDir/xdg-output-unstable-v1-protocol.c" \
         -o "$hudBuildDir/libgazeebo-hud.so" \
-        $(pkg-config --cflags --libs wayland-client pangocairo)
+        $(pkg-config --cflags --libs wayland-client pangocairo libei-1.0)
       install -Dm644 "$hudBuildDir/libgazeebo-hud.so" \
         "$out/lib/libgazeebo-hud.so"
     '';
@@ -75,6 +77,7 @@ let
       "gazeebo.training"
       "gazeebo.geometry"
       "gazeebo.hud"
+      "gazeebo.input_capture"
       "gazeebo.native"
       "gazeebo.portal"
       "gazeebo.recovery"
